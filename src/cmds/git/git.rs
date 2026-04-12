@@ -34,6 +34,90 @@ fn git_cmd(global_args: &[String]) -> Command {
     cmd
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitOperationState {
+    Merge,
+    Rebase,
+    CherryPick,
+    Bisect,
+}
+
+impl GitOperationState {
+    fn label(self) -> &'static str {
+        match self {
+            GitOperationState::Merge => "merge",
+            GitOperationState::Rebase => "rebase",
+            GitOperationState::CherryPick => "cherry-pick",
+            GitOperationState::Bisect => "bisect",
+        }
+    }
+
+    fn status_hint(self) -> &'static str {
+        match self {
+            GitOperationState::Merge => "(use \"git commit\" to conclude merge)",
+            GitOperationState::Rebase => "(use \"git rebase --continue\" to continue)",
+            GitOperationState::CherryPick => "(use \"git cherry-pick --continue\" to continue)",
+            GitOperationState::Bisect => "(use \"git bisect\" to continue)",
+        }
+    }
+}
+
+fn git_ref_exists(global_args: &[String], name: &str) -> bool {
+    git_cmd(global_args)
+        .args(["rev-parse", "-q", "--verify", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn git_path_exists(global_args: &[String], path: &str) -> bool {
+    let output = match git_cmd(global_args)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", path])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    let resolved = String::from_utf8_lossy(&output.stdout);
+    let raw = resolved.trim();
+    if raw.is_empty() {
+        return false;
+    }
+
+    std::path::Path::new(raw).exists()
+}
+
+fn detect_operation_state(global_args: &[String]) -> Option<GitOperationState> {
+    if git_ref_exists(global_args, "MERGE_HEAD") {
+        return Some(GitOperationState::Merge);
+    }
+    if git_ref_exists(global_args, "REBASE_HEAD")
+        || git_path_exists(global_args, "rebase-merge")
+        || git_path_exists(global_args, "rebase-apply")
+    {
+        return Some(GitOperationState::Rebase);
+    }
+    if git_ref_exists(global_args, "CHERRY_PICK_HEAD") || git_ref_exists(global_args, "REVERT_HEAD")
+    {
+        return Some(GitOperationState::CherryPick);
+    }
+    if git_path_exists(global_args, "BISECT_LOG") {
+        return Some(GitOperationState::Bisect);
+    }
+    None
+}
+
+fn is_machine_status_mode(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "-s"
+            || a == "--short"
+            || a == "--porcelain"
+            || a.starts_with("--porcelain=")
+            || a == "-z"
+    })
+}
+
 pub fn run(
     cmd: GitCommand,
     args: &[String],
@@ -591,21 +675,28 @@ fn truncate_line(line: &str, width: usize) -> String {
 }
 
 /// Format porcelain output into compact RTK status display
-fn format_status_output(porcelain: &str) -> String {
-    let lines: Vec<&str> = porcelain.lines().collect();
+fn format_status_output(porcelain: &str, op_state: Option<GitOperationState>) -> String {
+    let mut lines = porcelain.lines();
+    let first_line = match lines.next() {
+        Some(line) => line,
+        None => return "Clean working tree".to_string(),
+    };
 
-    if lines.is_empty() {
+    if first_line.is_empty() {
         return "Clean working tree".to_string();
     }
 
     let mut output = String::new();
 
     // Parse branch info
-    if let Some(branch_line) = lines.first() {
-        if branch_line.starts_with("##") {
-            let branch = branch_line.trim_start_matches("## ");
-            output.push_str(&format!("* {}\n", branch));
-        }
+    if first_line.starts_with("##") {
+        let branch = first_line.trim_start_matches("## ");
+        output.push_str(&format!("* {}\n", branch));
+    }
+
+    if let Some(state) = op_state {
+        output.push_str(&format!("state: {} in progress\n", state.label()));
+        output.push_str(&format!("{}\n", state.status_hint()));
     }
 
     // Count changes by type
@@ -618,7 +709,7 @@ fn format_status_output(porcelain: &str) -> String {
     let mut modified_files = Vec::new();
     let mut untracked_files = Vec::new();
 
-    for line in lines.iter().skip(1) {
+    for line in lines {
         if line.len() < 3 {
             continue;
         }
@@ -697,7 +788,7 @@ fn format_status_output(porcelain: &str) -> String {
     }
 
     // When working tree is clean (only branch line, no changes)
-    if staged == 0 && modified == 0 && untracked == 0 && conflicts == 0 {
+    if staged == 0 && modified == 0 && untracked == 0 && conflicts == 0 && op_state.is_none() {
         output.push_str("clean — nothing to commit\n");
     }
 
@@ -717,8 +808,7 @@ fn filter_status_with_args(output: &str) -> String {
         }
 
         // Skip git hints - can appear at start or within line
-        if trimmed.starts_with("(use \"git")
-            || trimmed.starts_with("(create/copy files")
+        if trimmed.starts_with("(create/copy files")
             || trimmed.contains("(use \"git add")
             || trimmed.contains("(use \"git restore")
         {
@@ -773,8 +863,13 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             eprint!("{}", stderr);
         }
 
-        // Apply minimal filtering: strip ANSI, remove hints, empty lines
-        let filtered = filter_status_with_args(&stdout);
+        // Preserve script/machine-readable status modes exactly.
+        let filtered = if is_machine_status_mode(args) {
+            stdout.to_string()
+        } else {
+            // Apply minimal filtering: remove non-essential hints and empty lines
+            filter_status_with_args(&stdout)
+        };
         print!("{}", filtered);
 
         timer.track(
@@ -810,7 +905,8 @@ fn run_status(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         return Ok(exit_code_from_output(&output, "git"));
     }
 
-    let formatted = format_status_output(&stdout);
+    let op_state = detect_operation_state(global_args);
+    let formatted = format_status_output(&stdout, op_state);
 
     println!("{}", formatted);
 
@@ -904,6 +1000,7 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     let timer = tracking::TimedExecution::start();
 
     let original_cmd = format!("git commit {}", args.join(" "));
+    let op_before = detect_operation_state(global_args);
 
     if verbose > 0 {
         eprintln!("{}", original_cmd);
@@ -919,6 +1016,18 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     let raw_output = format!("{}\n{}", stdout, stderr);
 
     if output.status.success() {
+        if op_before.is_some() {
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+
+            timer.track(&original_cmd, "rtk git commit", &raw_output, &raw_output);
+            return Ok(exit_code_from_output(&output, "git"));
+        }
+
         // Extract commit hash from output like "[main abc1234] message"
         let compact = if let Some(line) = stdout.lines().next() {
             if let Some(hash_start) = line.find(' ') {
@@ -947,6 +1056,17 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             "ok (nothing to commit)",
         );
     } else {
+        if op_before.is_some() {
+            if !stderr.trim().is_empty() {
+                eprint!("{}", stderr);
+            }
+            if !stdout.trim().is_empty() {
+                eprint!("{}", stdout);
+            }
+            timer.track(&original_cmd, "rtk git commit", &raw_output, &raw_output);
+            return Ok(exit_code_from_output(&output, "git"));
+        }
+
         if !stderr.trim().is_empty() {
             eprint!("{}", stderr);
         }
@@ -962,6 +1082,7 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
 
 fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    let op_before = detect_operation_state(global_args);
 
     if verbose > 0 {
         eprintln!("git push");
@@ -978,6 +1099,22 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw = format!("{}{}", stdout, stderr);
+
+    if op_before.is_some() {
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+        }
+        timer.track(
+            &format!("git push {}", args.join(" ")),
+            &format!("rtk git push {}", args.join(" ")),
+            &raw,
+            &raw,
+        );
+        return Ok(exit_code_from_output(&output, "git"));
+    }
 
     if output.status.success() {
         let compact = if stderr.contains("Everything up-to-date") {
@@ -1847,14 +1984,14 @@ mod tests {
     #[test]
     fn test_format_status_output_clean() {
         let porcelain = "";
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         assert_eq!(result, "Clean working tree");
     }
 
     #[test]
     fn test_format_status_output_modified_files() {
         let porcelain = "## main...origin/main\n M src/main.rs\n M src/lib.rs\n";
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         assert!(result.contains("* main...origin/main"));
         assert!(result.contains("~ Modified: 2 files"));
         assert!(result.contains("src/main.rs"));
@@ -1866,7 +2003,7 @@ mod tests {
     #[test]
     fn test_format_status_output_untracked_files() {
         let porcelain = "## feature/new\n?? temp.txt\n?? debug.log\n?? test.sh\n";
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         assert!(result.contains("* feature/new"));
         assert!(result.contains("? Untracked: 3 files"));
         assert!(result.contains("temp.txt"));
@@ -1883,7 +2020,7 @@ M  staged.rs
 A  added.rs
 ?? untracked.txt
 "#;
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         assert!(result.contains("* main"));
         assert!(result.contains("+ Staged: 2 files"));
         assert!(result.contains("staged.rs"));
@@ -1901,7 +2038,7 @@ A  added.rs
         for i in 1..=20 {
             porcelain.push_str(&format!("M  file{}.rs\n", i));
         }
-        let result = format_status_output(&porcelain);
+        let result = format_status_output(&porcelain, None);
         assert!(result.contains("+ Staged: 20 files"));
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file15.rs"));
@@ -1917,7 +2054,7 @@ A  added.rs
         for i in 1..=20 {
             porcelain.push_str(&format!(" M file{}.rs\n", i));
         }
-        let result = format_status_output(&porcelain);
+        let result = format_status_output(&porcelain, None);
         assert!(result.contains("~ Modified: 20 files"));
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file15.rs"));
@@ -1932,7 +2069,7 @@ A  added.rs
         for i in 1..=15 {
             porcelain.push_str(&format!("?? file{}.rs\n", i));
         }
-        let result = format_status_output(&porcelain);
+        let result = format_status_output(&porcelain, None);
         assert!(result.contains("? Untracked: 15 files"));
         assert!(result.contains("file1.rs"));
         assert!(result.contains("file10.rs"));
@@ -2108,9 +2245,27 @@ no changes added to commit (use "git add" and/or "git commit -a")
         assert!(result.contains("On branch main"));
         assert!(result.contains("modified:   src/main.rs"));
         assert!(
-            !result.contains("(use \"git"),
-            "Result should not contain git hints"
+            !result.contains("(use \"git add"),
+            "Result should not contain add hint"
         );
+        assert!(
+            !result.contains("(use \"git restore"),
+            "Result should not contain restore hint"
+        );
+    }
+
+    #[test]
+    fn test_filter_status_with_args_keeps_merge_guidance() {
+        let output = r#"On branch main
+All conflicts fixed but you are still merging.
+  (use "git commit" to conclude merge)
+
+Changes to be committed:
+	modified:   f.txt
+"#;
+        let result = filter_status_with_args(output);
+        assert!(result.contains("still merging"));
+        assert!(result.contains("(use \"git commit\" to conclude merge)"));
     }
 
     #[test]
@@ -2145,7 +2300,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     #[test]
     fn test_format_status_output_thai_filename() {
         let porcelain = "## main\n M สวัสดี.txt\n?? ทดสอบ.rs\n";
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         // Should not panic
         assert!(result.contains("* main"));
         assert!(result.contains("สวัสดี.txt"));
@@ -2155,7 +2310,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     #[test]
     fn test_format_status_output_emoji_filename() {
         let porcelain = "## main\nA  🎉-party.txt\n M 日本語ファイル.rs\n";
-        let result = format_status_output(porcelain);
+        let result = format_status_output(porcelain, None);
         assert!(result.contains("* main"));
     }
 
@@ -2354,7 +2509,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
         for i in 0..25 {
             porcelain.push_str(&format!("M  staged_file_{}.rs\n", i));
         }
-        let result = format_status_output(&porcelain);
+        let result = format_status_output(&porcelain, None);
         assert!(
             result.contains("+10 more"),
             "Expected '+10 more' for 25 staged files (max_files=15), got:\n{}",
@@ -2365,6 +2520,24 @@ no changes added to commit (use "git add" and/or "git commit -a")
             "Expected 'Staged: 25 files', got:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_format_status_output_no_clean_when_operation_in_progress() {
+        let porcelain = "## main\n";
+        let result = format_status_output(porcelain, Some(GitOperationState::Merge));
+        assert!(result.contains("state: merge in progress"));
+        assert!(!result.contains("clean — nothing to commit"));
+    }
+
+    #[test]
+    fn test_is_machine_status_mode() {
+        assert!(is_machine_status_mode(&["--short".to_string()]));
+        assert!(is_machine_status_mode(&["-s".to_string()]));
+        assert!(is_machine_status_mode(&["--porcelain".to_string()]));
+        assert!(is_machine_status_mode(&["--porcelain=v2".to_string()]));
+        assert!(is_machine_status_mode(&["-z".to_string()]));
+        assert!(!is_machine_status_mode(&["--branch".to_string()]));
     }
 
     #[test]
